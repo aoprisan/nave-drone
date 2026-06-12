@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect } from "react";
 
 // ─────────────────────────────────────────────────────────────
 // NAVE — drone engine v0
@@ -7,9 +7,9 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 // All pitch locked to one root. No tempo. LFOs ≤ 0.5 Hz.
 // ─────────────────────────────────────────────────────────────
 
-const ROOTS = { "B0": 30.87, "D1": 36.71, "E1": 41.2, "G1": 49.0, "A1": 55.0 };
-const SPACES = { chapel: 4, cistern: 9, infinite: 18 };
-const SAMPLES = ["bowed metal", "choir", "wind tape"];
+const ROOTS = { B0: 30.87, D1: 36.71, E1: 41.2, G1: 49.0, A1: 55.0 } as const;
+const SPACES = { chapel: 4, cistern: 9, infinite: 18 } as const;
+const SAMPLES = ["bowed metal", "choir", "wind tape"] as const;
 
 const RANGES = {
   droneLevel: [0, 0.9], droneDark: [0, 1],
@@ -18,9 +18,37 @@ const RANGES = {
   noiseLevel: [0, 0.7],
   cutoff: [120, 8000], lfoDepth: [0, 1], lfoRate: [0.01, 0.5],
   wet: [0.3, 1], drive: [0, 1], flutter: [0, 1], hiss: [0, 0.6],
-};
+} satisfies Record<string, readonly [number, number]>;
 
-const DEFAULT_PATCH = {
+type RootName = keyof typeof ROOTS;
+type SpaceName = keyof typeof SPACES;
+type SampleName = (typeof SAMPLES)[number];
+type RangeKey = keyof typeof RANGES;
+
+interface Patch {
+  root: RootName;
+  sampleType: SampleName;
+  space: SpaceName;
+  droneLevel: number;
+  droneDark: number;
+  sampleLevel: number;
+  grainSize: number;
+  grainDensity: number;
+  spray: number;
+  position: number;
+  noiseLevel: number;
+  cutoff: number;
+  lfoDepth: number;
+  lfoRate: number;
+  wet: number;
+  freeze: boolean;
+  drive: number;
+  flutter: number;
+  hiss: number;
+  seed: number;
+}
+
+const DEFAULT_PATCH: Patch = {
   root: "D1", sampleType: "bowed metal", space: "cistern",
   droneLevel: 0.55, droneDark: 0.7,
   sampleLevel: 0.45, grainSize: 0.6, grainDensity: 8, spray: 0.3, position: 0.3,
@@ -31,18 +59,63 @@ const DEFAULT_PATCH = {
   seed: 271,
 };
 
+// The live Web Audio graph. Built once in start(); thereafter only its params
+// are ramped (see applyPatch). React state `patch` is the UI source of truth;
+// this object is the audio source of truth — applyPatch is the only bridge.
+interface Engine {
+  ctx: AudioContext;
+  limiter: DynamicsCompressorNode;
+  master: GainNode;
+  analyser: AnalyserNode;
+  recDest: MediaStreamAudioDestinationNode;
+  driveIn: GainNode;
+  shaper: WaveShaperNode;
+  wowDelay: DelayNode;
+  wowLFO: OscillatorNode;
+  wowGain: GainNode;
+  rotMakeup: GainNode;
+  hissSrc: AudioBufferSourceNode;
+  hissFilter: BiquadFilterNode;
+  hissGain: GainNode;
+  irs: Record<SpaceName, AudioBuffer>;
+  preRev: GainNode;
+  dry: GainNode;
+  wet: GainNode;
+  convolver: ConvolverNode;
+  freezeDelay: DelayNode;
+  freezeFb: GainNode;
+  filter: BiquadFilterNode;
+  lfo1: OscillatorNode;
+  lfo1Gain: GainNode;
+  mix: GainNode;
+  droneFilter: BiquadFilterNode;
+  droneGain: GainNode;
+  drift: OscillatorNode;
+  driftGain: GainNode;
+  droneOscs: OscillatorNode[];
+  subOsc: OscillatorNode;
+  subGain: GainNode;
+  noiseSrc: AudioBufferSourceNode;
+  noiseFilter: BiquadFilterNode;
+  noiseGain: GainNode;
+  granGain: GainNode;
+  samples: Partial<Record<SampleName, AudioBuffer>>;
+  nextGrain: number;
+  grainTimer: ReturnType<typeof setInterval>;
+}
+
 // mulberry32 seeded PRNG
-function rng(seed) {
+function rng(seed: number): () => number {
   let a = seed >>> 0;
   return () => {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
 
-function makeIR(ctx, seconds) {
+function makeIR(ctx: AudioContext, seconds: number): AudioBuffer {
   const sr = ctx.sampleRate, len = Math.floor(sr * seconds);
   const buf = ctx.createBuffer(2, len, sr);
   for (let ch = 0; ch < 2; ch++) {
@@ -59,7 +132,7 @@ function makeIR(ctx, seconds) {
   return buf;
 }
 
-function makeBrownNoise(ctx, seconds = 5) {
+function makeBrownNoise(ctx: AudioContext, seconds = 5): AudioBuffer {
   const sr = ctx.sampleRate, len = sr * seconds;
   const buf = ctx.createBuffer(1, len, sr);
   const d = buf.getChannelData(0);
@@ -74,7 +147,7 @@ function makeBrownNoise(ctx, seconds = 5) {
 
 // Procedural sample bank, rendered offline. Base pitch = 110 Hz (A1 × 2);
 // grain playbackRate is scaled by root/55 so everything stays key-locked.
-async function renderSample(type, sr) {
+async function renderSample(type: SampleName, sr: number): Promise<AudioBuffer> {
   const dur = 8;
   const off = new OfflineAudioContext(2, sr * dur, sr);
   const out = off.createGain();
@@ -87,7 +160,7 @@ async function renderSample(type, sr) {
     ratios.forEach((r, i) => {
       const o = off.createOscillator();
       o.type = "sine"; o.frequency.value = base * r;
-      o.detune.value = (i % 2 ? 4 : -4);
+      o.detune.value = i % 2 ? 4 : -4;
       const g = off.createGain();
       g.gain.value = 0.5 / (i + 1);
       const lfo = off.createOscillator();
@@ -102,7 +175,7 @@ async function renderSample(type, sr) {
     [-7, 0, 7].forEach((det) => {
       const o = off.createOscillator();
       o.type = "sawtooth"; o.frequency.value = base; o.detune.value = det;
-      [[520, 6, 0.5], [900, 8, 0.35], [1450, 10, 0.2]].forEach(([f, q, a]) => {
+      ([[520, 6, 0.5], [900, 8, 0.35], [1450, 10, 0.2]] as const).forEach(([f, q, a]) => {
         const bp = off.createBiquadFilter();
         bp.type = "bandpass"; bp.frequency.value = f; bp.Q.value = q;
         const g = off.createGain(); g.gain.value = a * 0.35;
@@ -135,24 +208,25 @@ async function renderSample(type, sr) {
 export default function App() {
   const [started, setStarted] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [patch, setPatch] = useState(DEFAULT_PATCH);
+  const [patch, setPatch] = useState<Patch>(DEFAULT_PATCH);
   const [recording, setRecording] = useState(false);
-  const [recUrl, setRecUrl] = useState(null);
+  const [recUrl, setRecUrl] = useState<string | null>(null);
   const [mood, setMood] = useState("");
   const [claudeBusy, setClaudeBusy] = useState(false);
   const [claudeNote, setClaudeNote] = useState("");
 
-  const E = useRef(null);          // engine node graph
-  const patchRef = useRef(patch);  // for the grain scheduler
-  const canvasRef = useRef(null);
+  const E = useRef<Engine | null>(null); // engine node graph
+  const patchRef = useRef<Patch>(patch); // for the grain scheduler
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   patchRef.current = patch;
 
   // ── engine construction ────────────────────────────────────
   const start = async () => {
     setLoading(true);
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const Ctor = window.AudioContext || window.webkitAudioContext!;
+    const ctx = new Ctor();
     const sr = ctx.sampleRate;
-    const e = { ctx };
+    const e = { ctx } as Engine;
 
     // master
     e.limiter = ctx.createDynamicsCompressor();
@@ -171,7 +245,7 @@ export default function App() {
     e.shaper = ctx.createWaveShaper();
     const curve = new Float32Array(1024);
     for (let i = 0; i < 1024; i++) {
-      const x = (i / 511.5) - 1;
+      const x = i / 511.5 - 1;
       curve[i] = Math.tanh(2.2 * x);
     }
     e.shaper.curve = curve;
@@ -286,9 +360,9 @@ export default function App() {
   };
 
   // ── apply a patch to the live graph ────────────────────────
-  const applyPatch = (e, p, ramp = 0.08) => {
+  const applyPatch = (e: Engine, p: Patch, ramp = 0.08) => {
     const t = e.ctx.currentTime;
-    const set = (param, v) => {
+    const set = (param: AudioParam, v: number) => {
       param.cancelScheduledValues(t);
       param.setValueAtTime(param.value, t);
       param.linearRampToValueAtTime(v, t + ramp);
@@ -314,7 +388,7 @@ export default function App() {
     set(e.hissGain.gain, p.hiss * 0.025);
   };
 
-  const update = (key, value) => {
+  const update = <K extends keyof Patch>(key: K, value: Patch[K]) => {
     const p = { ...patch, [key]: value };
     setPatch(p);
     if (E.current) applyPatch(E.current, p, key === "freeze" ? 0.4 : 0.08);
@@ -324,13 +398,13 @@ export default function App() {
   const ritual = () => {
     const seed = (patch.seed * 16807 + Date.now()) % 2147483647;
     const r = rng(seed);
-    const pick = (arr) => arr[Math.floor(r() * arr.length)];
-    const span = ([a, b]) => a + r() * (b - a);
-    const p = {
+    const pick = <T,>(arr: readonly T[]): T => arr[Math.floor(r() * arr.length)];
+    const span = ([a, b]: readonly [number, number]) => a + r() * (b - a);
+    const p: Patch = {
       ...patch, seed,
-      root: pick(Object.keys(ROOTS)),
+      root: pick(Object.keys(ROOTS) as RootName[]),
       sampleType: pick(SAMPLES),
-      space: pick(Object.keys(SPACES)),
+      space: pick(Object.keys(SPACES) as SpaceName[]),
       droneLevel: span([0.3, 0.8]), droneDark: span([0.4, 1]),
       sampleLevel: span([0.2, 0.8]),
       grainSize: span([0.15, 1.8]), grainDensity: span([3, 22]),
@@ -350,7 +424,7 @@ export default function App() {
     if (!mood.trim() || !E.current) return;
     setClaudeBusy(true); setClaudeNote("");
     try {
-      const editable = Object.fromEntries(Object.keys(RANGES).map(k => [k, patch[k]]));
+      const editable = Object.fromEntries((Object.keys(RANGES) as RangeKey[]).map((k) => [k, patch[k]]));
       const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -364,36 +438,37 @@ Current patch: ${JSON.stringify(editable)}
 Parameter ranges: ${JSON.stringify(RANGES)}
 Also choose: "root" from ${JSON.stringify(Object.keys(ROOTS))}, "sampleType" from ${JSON.stringify(SAMPLES)}, "space" from ${JSON.stringify(Object.keys(SPACES))}.
 Notes: droneDark higher = darker; grainSize in seconds; lfoRate in Hz (slow); wet = reverb amount; drive/flutter/hiss = tape rot.
-Respond with ONLY a JSON object: every key above, plus a "note" key with one short poetic sentence describing the scene. No markdown, no backticks.`
+Respond with ONLY a JSON object: every key above, plus a "note" key with one short poetic sentence describing the scene. No markdown, no backticks.`,
           }],
         }),
       });
       const data = await res.json();
-      const text = data.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+      const text = (data.content as Array<{ type: string; text: string }>)
+        .filter((b) => b.type === "text").map((b) => b.text).join("\n");
       const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
-      const p = { ...patch };
-      for (const [k, [lo, hi]] of Object.entries(RANGES)) {
+      const p: Patch = { ...patch };
+      for (const [k, [lo, hi]] of Object.entries(RANGES) as [RangeKey, [number, number]][]) {
         if (typeof parsed[k] === "number") p[k] = Math.min(hi, Math.max(lo, parsed[k]));
       }
-      if (ROOTS[parsed.root]) p.root = parsed.root;
-      if (SAMPLES.includes(parsed.sampleType)) p.sampleType = parsed.sampleType;
-      if (SPACES[parsed.space] !== undefined) p.space = parsed.space;
+      if (parsed.root in ROOTS) p.root = parsed.root as RootName;
+      if (SAMPLES.includes(parsed.sampleType)) p.sampleType = parsed.sampleType as SampleName;
+      if (parsed.space in SPACES) p.space = parsed.space as SpaceName;
       setPatch(p);
       applyPatch(E.current, p, 9); // Claude's edits arrive as weather
       setClaudeNote(parsed.note || "");
-    } catch (err) {
+    } catch {
       setClaudeNote("The oracle was silent. Try again.");
     }
     setClaudeBusy(false);
   };
 
   // ── recording ──────────────────────────────────────────────
-  const recRef = useRef(null);
+  const recRef = useRef<MediaRecorder | null>(null);
   const toggleRecord = () => {
     const e = E.current;
     if (!e) return;
     if (!recording) {
-      const chunks = [];
+      const chunks: Blob[] = [];
       const mr = new MediaRecorder(e.recDest.stream);
       mr.ondataavailable = (ev) => chunks.push(ev.data);
       mr.onstop = () => setRecUrl(URL.createObjectURL(new Blob(chunks, { type: "audio/webm" })));
@@ -412,10 +487,10 @@ Respond with ONLY a JSON object: every key above, plus a "note" key with one sho
     if (!started) return;
     const cv = canvasRef.current, e = E.current;
     if (!cv || !e) return;
-    const ctx2d = cv.getContext("2d");
+    const ctx2d = cv.getContext("2d")!;
     const data = new Uint8Array(e.analyser.frequencyBinCount);
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    let raf;
+    let raf = 0;
     const draw = () => {
       const w = cv.width = cv.offsetWidth * 2;
       const h = cv.height = cv.offsetHeight * 2;
@@ -429,7 +504,7 @@ Respond with ONLY a JSON object: every key above, plus a "note" key with one sho
         const hgt = v * h * 0.92;
         const grad = ctx2d.createLinearGradient(0, h - hgt, 0, h);
         grad.addColorStop(0, "rgba(201,123,61,0)");
-        grad.addColorStop(0.5, `rgba(150,60,40,${0.10 + v * 0.32})`);
+        grad.addColorStop(0.5, `rgba(150,60,40,${0.1 + v * 0.32})`);
         grad.addColorStop(1, `rgba(110,30,30,${0.22 + v * 0.4})`);
         ctx2d.fillStyle = grad;
         ctx2d.fillRect(x, h - hgt, w / bins - 1.5, hgt);
@@ -447,26 +522,34 @@ Respond with ONLY a JSON object: every key above, plus a "note" key with one sho
   }, []);
 
   // ── UI ─────────────────────────────────────────────────────
-  const Slider = ({ k, label, fmt }) => {
+  const Slider = ({ k, label, fmt }: { k: RangeKey; label: string; fmt?: (v: number) => string }) => {
     const [lo, hi] = RANGES[k];
     const v = patch[k];
     return (
       <div className="row">
         <span className="lbl">{label}</span>
-        <input type="range" min={lo} max={hi} step={(hi - lo) / 200} value={v}
-          onChange={(ev) => update(k, parseFloat(ev.target.value))} />
+        <input
+          type="range" min={lo} max={hi} step={(hi - lo) / 200} value={v}
+          onChange={(ev) => update(k, parseFloat(ev.target.value))}
+        />
         <span className="val">{fmt ? fmt(v) : v.toFixed(2)}</span>
       </div>
     );
   };
 
-  const Choice = ({ k, options, label }) => (
+  const Choice = <K extends "root" | "sampleType" | "space">(
+    { k, options, label }: { k: K; options: readonly Patch[K][]; label: string },
+  ) => (
     <div className="row">
       <span className="lbl">{label}</span>
       <div className="choices">
         {options.map((o) => (
-          <button key={o} className={patch[k] === o ? "chip on" : "chip"}
-            onClick={() => update(k, o)}>{o}</button>
+          <button
+            key={String(o)} className={patch[k] === o ? "chip on" : "chip"}
+            onClick={() => update(k, o)}
+          >
+            {String(o)}
+          </button>
         ))}
       </div>
     </div>
@@ -493,8 +576,10 @@ Respond with ONLY a JSON object: every key above, plus a "note" key with one sho
 
           <div className="actions">
             <button className="big" onClick={ritual}>☉ ritual — re-seed</button>
-            <button className={patch.freeze ? "big on" : "big"}
-              onClick={() => update("freeze", !patch.freeze)}>
+            <button
+              className={patch.freeze ? "big on" : "big"}
+              onClick={() => update("freeze", !patch.freeze)}
+            >
               ❄ freeze {patch.freeze ? "· held" : ""}
             </button>
             <button className={recording ? "big rec" : "big"} onClick={toggleRecord}>
@@ -505,7 +590,7 @@ Respond with ONLY a JSON object: every key above, plus a "note" key with one sho
 
           <section>
             <h2>foundation</h2>
-            <Choice k="root" label="root" options={Object.keys(ROOTS)} />
+            <Choice k="root" label="root" options={Object.keys(ROOTS) as RootName[]} />
             <Slider k="droneLevel" label="drone" />
             <Slider k="droneDark" label="darkness" />
             <Slider k="noiseLevel" label="floor" />
@@ -526,7 +611,7 @@ Respond with ONLY a JSON object: every key above, plus a "note" key with one sho
             <Slider k="cutoff" label="filter" fmt={(v) => v.toFixed(0) + "Hz"} />
             <Slider k="lfoDepth" label="breath depth" />
             <Slider k="lfoRate" label="breath rate" fmt={(v) => v.toFixed(2) + "Hz"} />
-            <Choice k="space" label="space" options={Object.keys(SPACES)} />
+            <Choice k="space" label="space" options={Object.keys(SPACES) as SpaceName[]} />
             <Slider k="wet" label="immersion" />
           </section>
 
@@ -540,9 +625,11 @@ Respond with ONLY a JSON object: every key above, plus a "note" key with one sho
           <section className="oracle">
             <h2>oracle</h2>
             <div className="askrow">
-              <input type="text" value={mood} placeholder="frostbitten · hollow · liturgical…"
+              <input
+                type="text" value={mood} placeholder="frostbitten · hollow · liturgical…"
                 onChange={(ev) => setMood(ev.target.value)}
-                onKeyDown={(ev) => ev.key === "Enter" && askClaude()} />
+                onKeyDown={(ev) => ev.key === "Enter" && askClaude()}
+              />
               <button className="big" onClick={askClaude} disabled={claudeBusy}>
                 {claudeBusy ? "listening…" : "ask claude"}
               </button>

@@ -1,0 +1,17 @@
+node_modules
+dist
+dist-ssr
+*.local
+*.tsbuildinfo
+
+# Generated PWA icons (produced by `npm run icons` during build)
+public/pwa-192.png
+public/pwa-512.png
+public/apple-touch-icon.png
+
+# Editor / OS
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.log
