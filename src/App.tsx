@@ -8,7 +8,7 @@ import { useState, useRef, useEffect } from "react";
 // ─────────────────────────────────────────────────────────────
 
 const ROOTS = { B0: 30.87, D1: 36.71, E1: 41.2, G1: 49.0, A1: 55.0 } as const;
-const SPACES = { chapel: 4, cistern: 9, infinite: 18 } as const;
+const SPACES = { chapel: 7, cistern: 16, infinite: 34 } as const;
 const SAMPLES = ["bowed metal", "choir", "wind tape"] as const;
 
 const RANGES = {
@@ -118,15 +118,18 @@ function rng(seed: number): () => number {
 function makeIR(ctx: AudioContext, seconds: number): AudioBuffer {
   const sr = ctx.sampleRate, len = Math.floor(sr * seconds);
   const buf = ctx.createBuffer(2, len, sr);
+  const pre = Math.floor(sr * 0.04); // pre-delay: distance to the first wall
   for (let ch = 0; ch < 2; ch++) {
     const d = buf.getChannelData(ch);
     let lp = 0;
     for (let i = 0; i < len; i++) {
-      const t = i / len;
-      const env = Math.pow(1 - t, 2.5) * Math.exp(-3 * t);
+      if (i < pre) { d[i] = 0; continue; } // silence before the space answers
+      const t = (i - pre) / (len - pre);
+      // slow, late-blooming decay — the tail hangs in the air
+      const env = Math.pow(1 - t, 1.7) * Math.exp(-1.5 * t);
       const n = Math.random() * 2 - 1;
-      lp = lp * 0.93 + n * 0.07; // darken the tail
-      d[i] = lp * env * 2.2;
+      lp = lp * 0.97 + n * 0.03; // heavier darkening = distant stone
+      d[i] = lp * env * 2.8; // makeup for the extra lowpass
     }
   }
   return buf;
