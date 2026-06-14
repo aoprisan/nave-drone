@@ -15,7 +15,7 @@ import { useRegisterSW } from "virtual:pwa-register/react";
 
 const ROOTS = { B0: 30.87, D1: 36.71, E1: 41.2, G1: 49.0, A1: 55.0 } as const;
 const SPACES = { chapel: 7, cistern: 16, infinite: 34 } as const;
-const SAMPLES = ["bowed metal", "choir", "wind tape"] as const;
+const SAMPLES = ["bowed metal", "choir", "chant", "wind tape"] as const;
 
 const RANGES = {
   droneLevel: [0, 0.9], droneDark: [0, 1],
@@ -209,6 +209,51 @@ async function renderSample(type: SampleName, sr: number): Promise<AudioBuffer> 
       });
       o.start();
     });
+  } else if (type === "chant") {
+    // monastic drone: unison + fifth + octave, each a detuned pair (chorus),
+    // with vibrato and a slow shared vowel morph between "oh" and "ah".
+    const voices = [1, 1.5, 2];
+    // per-formant [oh, ah] band centers for F1, F2, F3
+    const vowels = [[450, 800], [800, 1150], [2830, 2900]] as const;
+    voices.forEach((ratio, vi) => {
+      [-6, 6].forEach((det) => {
+        const o = off.createOscillator();
+        o.type = "sawtooth"; o.frequency.value = base * ratio; o.detune.value = det;
+        // vibrato on pitch
+        const vib = off.createOscillator();
+        vib.frequency.value = 4.8 + vi * 0.6;
+        const vibg = off.createGain(); vibg.gain.value = 7; // cents
+        vib.connect(vibg); vibg.connect(o.detune);
+        // independent slow breath/swell per strand
+        const vg = off.createGain(); vg.gain.value = 0.22 / voices.length;
+        const swell = off.createOscillator();
+        swell.frequency.value = 0.05 + vi * 0.017;
+        const sg = off.createGain(); sg.gain.value = 0.16 / voices.length;
+        swell.connect(sg); sg.connect(vg.gain);
+        o.connect(vg);
+        // slow vowel morph (oh→ah) drives every formant in lock-step
+        const morph = off.createOscillator();
+        morph.frequency.value = 0.04;
+        vowels.forEach(([a, b], fi) => {
+          const bp = off.createBiquadFilter();
+          bp.type = "bandpass"; bp.frequency.value = (a + b) / 2; bp.Q.value = 7 + fi * 2;
+          const mg = off.createGain(); mg.gain.value = (b - a) / 2;
+          morph.connect(mg); mg.connect(bp.frequency);
+          const g = off.createGain(); g.gain.value = 0.4 - fi * 0.1;
+          vg.connect(bp); bp.connect(g); g.connect(out);
+        });
+        o.start(); vib.start(); swell.start(); morph.start();
+      });
+    });
+    // faint breath on top of the vowels
+    const nb = off.createBuffer(1, sr * dur, sr);
+    const d = nb.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    const src = off.createBufferSource(); src.buffer = nb;
+    const hp = off.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 2000;
+    const bg = off.createGain(); bg.gain.value = 0.015;
+    src.connect(hp); hp.connect(bg); bg.connect(out);
+    src.start();
   } else { // wind tape
     const nb = off.createBuffer(1, sr * dur, sr);
     const d = nb.getChannelData(0);
