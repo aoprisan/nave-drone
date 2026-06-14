@@ -1,4 +1,9 @@
 import { useState, useRef, useEffect } from "react";
+import type {
+  PointerEvent as ReactPointerEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  WheelEvent as ReactWheelEvent,
+} from "react";
 
 // ─────────────────────────────────────────────────────────────
 // NAVE — drone engine v0
@@ -576,19 +581,94 @@ Respond with ONLY a JSON object: every key above, plus a "note" key with one sho
   }, []);
 
   // ── UI ─────────────────────────────────────────────────────
-  const Slider = (
+  // A rotary dial — drag (vertical), wheel, or arrow keys. 270° sweep with a
+  // gap at the bottom; min at 7:30, max at 4:30. Replaces the old <input range>
+  // but speaks the same language: it only ever calls update(k, …).
+  const Dial = (
     { k, label, fmt, disabled }: { k: RangeKey; label: string; fmt?: (v: number) => string; disabled?: boolean },
   ) => {
     const [lo, hi] = RANGES[k];
     const v = patch[k];
+    const span = hi - lo;
+    const f = (v - lo) / span;
+    const angle = -135 + f * 270;
+
+    // angle measured clockwise from 12 o'clock → screen coords (cx=cy=32)
+    const polar = (a: number, r: number): [number, number] => {
+      const rad = (a * Math.PI) / 180;
+      return [32 + r * Math.sin(rad), 32 - r * Math.cos(rad)];
+    };
+    const arc = (a0: number, a1: number, r: number) => {
+      const [x0, y0] = polar(a0, r);
+      const [x1, y1] = polar(a1, r);
+      const large = Math.abs(a1 - a0) > 180 ? 1 : 0;
+      return `M ${x0.toFixed(2)} ${y0.toFixed(2)} A ${r} ${r} 0 ${large} 1 ${x1.toFixed(2)} ${y1.toFixed(2)}`;
+    };
+    const [ix, iy] = polar(angle, 7);
+    const [ox, oy] = polar(angle, 20);
+
+    const clamp = (x: number) => Math.max(lo, Math.min(hi, x));
+    const nudge = (d: number) => { const nv = clamp(v + d); if (nv !== v) update(k, nv); };
+
+    const onPointerDown = (ev: ReactPointerEvent<HTMLDivElement>) => {
+      if (disabled) return;
+      ev.preventDefault();
+      const startY = ev.clientY, startVal = v, el = ev.currentTarget;
+      el.setPointerCapture(ev.pointerId);
+      const move = (e: PointerEvent) => update(k, clamp(startVal + ((startY - e.clientY) / 180) * span));
+      const up = () => {
+        el.releasePointerCapture(ev.pointerId);
+        el.removeEventListener("pointermove", move);
+        el.removeEventListener("pointerup", up);
+        el.removeEventListener("pointercancel", up);
+      };
+      el.addEventListener("pointermove", move);
+      el.addEventListener("pointerup", up);
+      el.addEventListener("pointercancel", up);
+    };
+
+    const onKeyDown = (ev: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (disabled) return;
+      const step = span / 100, big = span / 10;
+      switch (ev.key) {
+        case "ArrowUp": case "ArrowRight": ev.preventDefault(); nudge(step); break;
+        case "ArrowDown": case "ArrowLeft": ev.preventDefault(); nudge(-step); break;
+        case "PageUp": ev.preventDefault(); nudge(big); break;
+        case "PageDown": ev.preventDefault(); nudge(-big); break;
+        case "Home": ev.preventDefault(); update(k, lo); break;
+        case "End": ev.preventDefault(); update(k, hi); break;
+      }
+    };
+
+    const onWheel = (ev: ReactWheelEvent<HTMLDivElement>) => {
+      if (disabled) return;
+      nudge((ev.deltaY < 0 ? 1 : -1) * (span / 50));
+    };
+
     return (
-      <div className="row">
-        <span className="lbl">{label}{disabled ? " ◑" : ""}</span>
-        <input
-          type="range" min={lo} max={hi} step={(hi - lo) / 200} value={v} disabled={disabled}
-          onChange={(ev) => update(k, parseFloat(ev.target.value))}
-        />
-        <span className="val">{fmt ? fmt(v) : v.toFixed(2)}</span>
+      <div
+        className={"dial" + (disabled ? " off" : "")}
+        role="slider"
+        tabIndex={disabled ? -1 : 0}
+        aria-label={label}
+        aria-valuemin={lo}
+        aria-valuemax={hi}
+        aria-valuenow={Number(v.toFixed(3))}
+        aria-valuetext={fmt ? fmt(v) : v.toFixed(2)}
+        aria-disabled={disabled || undefined}
+        onPointerDown={onPointerDown}
+        onKeyDown={onKeyDown}
+        onWheel={onWheel}
+      >
+        <svg viewBox="0 0 64 64" className="knob" aria-hidden="true">
+          <circle cx="32" cy="32" r="27" className="knob-cap" />
+          <path d={arc(-135, 135, 25)} className="knob-track" />
+          {f > 0.001 && <path d={arc(-135, angle, 25)} className="knob-fill" />}
+          <line x1={ix} y1={iy} x2={ox} y2={oy} className="knob-ptr" />
+          <circle cx="32" cy="32" r="4.5" className="knob-hub" />
+        </svg>
+        <span className="dlbl">{label}{disabled ? " ◑" : ""}</span>
+        <span className="dval">{fmt ? fmt(v) : v.toFixed(2)}</span>
       </div>
     );
   };
@@ -653,35 +733,43 @@ Respond with ONLY a JSON object: every key above, plus a "note" key with one sho
           <section>
             <h2>foundation</h2>
             <Choice k="root" label="root" options={Object.keys(ROOTS) as RootName[]} />
-            <Slider k="droneLevel" label="drone" disabled={patch.moonLink} />
-            <Slider k="droneDark" label="darkness" disabled={patch.moonLink} />
-            <Slider k="noiseLevel" label="floor" />
+            <div className="dials">
+              <Dial k="droneLevel" label="drone" disabled={patch.moonLink} />
+              <Dial k="droneDark" label="darkness" disabled={patch.moonLink} />
+              <Dial k="noiseLevel" label="floor" />
+            </div>
           </section>
 
           <section>
             <h2>grains</h2>
             <Choice k="sampleType" label="source" options={SAMPLES} />
-            <Slider k="sampleLevel" label="level" />
-            <Slider k="grainSize" label="size" fmt={(v) => v.toFixed(2) + "s"} />
-            <Slider k="grainDensity" label="density" fmt={(v) => v.toFixed(0) + "/s"} />
-            <Slider k="position" label="position" />
-            <Slider k="spray" label="spray" />
+            <div className="dials">
+              <Dial k="sampleLevel" label="level" />
+              <Dial k="grainSize" label="size" fmt={(v) => v.toFixed(2) + "s"} />
+              <Dial k="grainDensity" label="density" fmt={(v) => v.toFixed(0) + "/s"} />
+              <Dial k="position" label="position" />
+              <Dial k="spray" label="spray" />
+            </div>
           </section>
 
           <section>
             <h2>air</h2>
-            <Slider k="cutoff" label="filter" fmt={(v) => v.toFixed(0) + "Hz"} />
-            <Slider k="lfoDepth" label="breath depth" />
-            <Slider k="lfoRate" label="breath rate" fmt={(v) => v.toFixed(2) + "Hz"} />
+            <div className="dials">
+              <Dial k="cutoff" label="filter" fmt={(v) => v.toFixed(0) + "Hz"} />
+              <Dial k="lfoDepth" label="breath depth" />
+              <Dial k="lfoRate" label="breath rate" fmt={(v) => v.toFixed(2) + "Hz"} />
+              <Dial k="wet" label="immersion" />
+            </div>
             <Choice k="space" label="space" options={Object.keys(SPACES) as SpaceName[]} />
-            <Slider k="wet" label="immersion" />
           </section>
 
           <section>
             <h2>rot</h2>
-            <Slider k="drive" label="saturation" />
-            <Slider k="flutter" label="wow" />
-            <Slider k="hiss" label="hiss" />
+            <div className="dials">
+              <Dial k="drive" label="saturation" />
+              <Dial k="flutter" label="wow" />
+              <Dial k="hiss" label="hiss" />
+            </div>
           </section>
 
           <section className="oracle">
@@ -729,13 +817,20 @@ section{border:1px solid #2a201a;padding:12px 14px;margin-bottom:12px;background
 h2{font-size:11px;letter-spacing:0.3em;text-transform:uppercase;color:#9c5230;margin:0 0 10px;font-weight:400}
 .row{display:flex;align-items:center;gap:10px;margin-bottom:8px}
 .lbl{width:88px;font-size:12px;color:#a89878;letter-spacing:0.06em;flex-shrink:0}
-.val{width:58px;font-size:11px;color:#c97b3d;font-family:ui-monospace,monospace;text-align:right;flex-shrink:0}
-input[type=range]{flex:1;appearance:none;-webkit-appearance:none;height:2px;background:#3a2c22;outline:none}
-input[type=range]::-webkit-slider-thumb{appearance:none;-webkit-appearance:none;width:14px;height:14px;
-  background:#7a2020;border:1px solid #c97b3d;border-radius:50%;cursor:pointer}
-input[type=range]::-moz-range-thumb{width:13px;height:13px;background:#7a2020;border:1px solid #c97b3d;border-radius:50%;cursor:pointer}
-input[type=range]:focus-visible::-webkit-slider-thumb{outline:2px solid #c97b3d;outline-offset:2px}
-input[type=range]:disabled{opacity:0.4;cursor:not-allowed}
+.dials{display:flex;flex-wrap:wrap;gap:6px 2px;margin:6px 0 2px}
+.dial{width:84px;display:flex;flex-direction:column;align-items:center;gap:2px;
+  padding:6px 2px;cursor:ns-resize;touch-action:none;outline:none;border-radius:5px;
+  user-select:none;-webkit-user-select:none}
+.dial:focus-visible{outline:1px solid #c97b3d;outline-offset:2px}
+.dial.off{opacity:0.4;cursor:not-allowed}
+.knob{width:52px;height:52px;display:block}
+.knob-cap{fill:#181009;stroke:#2a201a;stroke-width:1}
+.knob-track{fill:none;stroke:#3a2c22;stroke-width:3;stroke-linecap:round}
+.knob-fill{fill:none;stroke:#c97b3d;stroke-width:3;stroke-linecap:round}
+.knob-ptr{stroke:#e6dcc4;stroke-width:2;stroke-linecap:round}
+.knob-hub{fill:#7a2020;stroke:#c97b3d;stroke-width:1}
+.dlbl{font-size:11px;color:#a89878;letter-spacing:0.04em;text-align:center;line-height:1.2}
+.dval{font-size:10px;color:#c97b3d;font-family:ui-monospace,monospace}
 .choices{display:flex;flex-wrap:wrap;gap:6px}
 .chip{background:transparent;border:1px solid #3a2c22;color:#a89878;padding:4px 10px;font-family:inherit;
   font-size:11px;letter-spacing:0.08em;cursor:pointer}
