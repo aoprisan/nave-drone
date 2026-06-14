@@ -42,6 +42,7 @@ interface Patch {
   lfoRate: number;
   wet: number;
   freeze: boolean;
+  moonLink: boolean;
   drive: number;
   flutter: number;
   hiss: number;
@@ -54,10 +55,26 @@ const DEFAULT_PATCH: Patch = {
   sampleLevel: 0.45, grainSize: 0.6, grainDensity: 8, spray: 0.3, position: 0.3,
   noiseLevel: 0.18,
   cutoff: 900, lfoDepth: 0.35, lfoRate: 0.06,
-  wet: 0.75, freeze: false,
+  wet: 0.75, freeze: false, moonLink: false,
   drive: 0.3, flutter: 0.35, hiss: 0.15,
   seed: 271,
 };
+
+// ── the moon ──────────────────────────────────────────────────
+// Real lunar phase from wall-clock time, computed (no deps, no assets).
+// Synodic month and a known new-moon epoch (2000-01-06 18:14 UTC).
+const SYNODIC = 29.530588853 * 86400 * 1000;
+const NEW_MOON_EPOCH = Date.UTC(2000, 0, 6, 18, 14);
+// position in the cycle, 0..1 — 0 = new, 0.5 = full, → back to new
+const moonFraction = (ms: number) => {
+  const f = ((ms - NEW_MOON_EPOCH) % SYNODIC) / SYNODIC;
+  return f < 0 ? f + 1 : f;
+};
+const MOON_NAMES = [
+  "new", "waxing crescent", "first quarter", "waxing gibbous",
+  "full", "waning gibbous", "last quarter", "waning crescent",
+] as const;
+const moonPhaseName = (frac: number) => MOON_NAMES[Math.floor(frac * 8 + 0.5) % 8];
 
 // The live Web Audio graph. Built once in start(); thereafter only its params
 // are ramped (see applyPatch). React state `patch` is the UI source of truth;
@@ -397,6 +414,27 @@ export default function App() {
     if (E.current) applyPatch(E.current, p, key === "freeze" ? 0.4 : 0.08);
   };
 
+  // ── moon binding: drive the bass drone from the lunar phase ──
+  // new moon → darkest & most subdued; full moon → brightest & most present.
+  const moonDrive = (): Pick<Patch, "droneDark" | "droneLevel"> => {
+    const illum = (1 - Math.cos(2 * Math.PI * moonFraction(Date.now()))) / 2; // 0 new, 1 full
+    const clamp = (k: RangeKey, v: number) => Math.min(RANGES[k][1], Math.max(RANGES[k][0], v));
+    return {
+      droneDark: clamp("droneDark", 1 - illum),       // new = max dark
+      droneLevel: clamp("droneLevel", 0.35 + illum * 0.45), // new = quiet, full = loud
+    };
+  };
+
+  const toggleMoonLink = () => {
+    if (!patch.moonLink) {
+      const p = { ...patch, moonLink: true, ...moonDrive() };
+      setPatch(p);
+      if (E.current) applyPatch(E.current, p, 0.4);
+    } else {
+      setPatch({ ...patch, moonLink: false });
+    }
+  };
+
   // ── the ritual: seeded re-patch, slow crossfade ────────────
   const ritual = () => {
     const seed = (patch.seed * 16807 + Date.now()) % 2147483647;
@@ -418,6 +456,7 @@ export default function App() {
       wet: span([0.5, 1]), drive: span(RANGES.drive),
       flutter: span(RANGES.flutter), hiss: span([0, 0.45]),
     };
+    if (p.moonLink) Object.assign(p, moonDrive()); // the moon outranks the re-seed
     setPatch(p);
     if (E.current) applyPatch(E.current, p, 7); // 7-second becoming
   };
@@ -456,6 +495,7 @@ Respond with ONLY a JSON object: every key above, plus a "note" key with one sho
       if (parsed.root in ROOTS) p.root = parsed.root as RootName;
       if (SAMPLES.includes(parsed.sampleType)) p.sampleType = parsed.sampleType as SampleName;
       if (parsed.space in SPACES) p.space = parsed.space as SpaceName;
+      if (p.moonLink) Object.assign(p, moonDrive()); // the moon outranks the oracle
       setPatch(p);
       applyPatch(E.current, p, 9); // Claude's edits arrive as weather
       setClaudeNote(parsed.note || "");
@@ -519,20 +559,33 @@ Respond with ONLY a JSON object: every key above, plus a "note" key with one sho
     return () => cancelAnimationFrame(raf);
   }, [started]);
 
+  // ── moon drift: re-assert the lunar bass over long sessions ──
+  useEffect(() => {
+    if (!started || !patch.moonLink) return;
+    const id = setInterval(() => {
+      const drive = moonDrive();
+      setPatch((p) => (p.moonLink ? { ...p, ...drive } : p));
+      if (E.current) applyPatch(E.current, { ...patchRef.current, ...drive }, 8);
+    }, 5 * 60 * 1000);
+    return () => clearInterval(id);
+  }, [started, patch.moonLink]);
+
   useEffect(() => () => { // teardown
     const e = E.current;
     if (e) { clearInterval(e.grainTimer); e.ctx.close(); }
   }, []);
 
   // ── UI ─────────────────────────────────────────────────────
-  const Slider = ({ k, label, fmt }: { k: RangeKey; label: string; fmt?: (v: number) => string }) => {
+  const Slider = (
+    { k, label, fmt, disabled }: { k: RangeKey; label: string; fmt?: (v: number) => string; disabled?: boolean },
+  ) => {
     const [lo, hi] = RANGES[k];
     const v = patch[k];
     return (
       <div className="row">
-        <span className="lbl">{label}</span>
+        <span className="lbl">{label}{disabled ? " ◑" : ""}</span>
         <input
-          type="range" min={lo} max={hi} step={(hi - lo) / 200} value={v}
+          type="range" min={lo} max={hi} step={(hi - lo) / 200} value={v} disabled={disabled}
           onChange={(ev) => update(k, parseFloat(ev.target.value))}
         />
         <span className="val">{fmt ? fmt(v) : v.toFixed(2)}</span>
@@ -585,6 +638,12 @@ Respond with ONLY a JSON object: every key above, plus a "note" key with one sho
             >
               ❄ freeze {patch.freeze ? "· held" : ""}
             </button>
+            <button
+              className={patch.moonLink ? "big on" : "big"}
+              onClick={toggleMoonLink}
+            >
+              ☾ moon-bound {patch.moonLink ? "· " + moonPhaseName(moonFraction(Date.now())) : ""}
+            </button>
             <button className={recording ? "big rec" : "big"} onClick={toggleRecord}>
               {recording ? "■ stop" : "● record"}
             </button>
@@ -594,8 +653,8 @@ Respond with ONLY a JSON object: every key above, plus a "note" key with one sho
           <section>
             <h2>foundation</h2>
             <Choice k="root" label="root" options={Object.keys(ROOTS) as RootName[]} />
-            <Slider k="droneLevel" label="drone" />
-            <Slider k="droneDark" label="darkness" />
+            <Slider k="droneLevel" label="drone" disabled={patch.moonLink} />
+            <Slider k="droneDark" label="darkness" disabled={patch.moonLink} />
             <Slider k="noiseLevel" label="floor" />
           </section>
 
@@ -676,6 +735,7 @@ input[type=range]::-webkit-slider-thumb{appearance:none;-webkit-appearance:none;
   background:#7a2020;border:1px solid #c97b3d;border-radius:50%;cursor:pointer}
 input[type=range]::-moz-range-thumb{width:13px;height:13px;background:#7a2020;border:1px solid #c97b3d;border-radius:50%;cursor:pointer}
 input[type=range]:focus-visible::-webkit-slider-thumb{outline:2px solid #c97b3d;outline-offset:2px}
+input[type=range]:disabled{opacity:0.4;cursor:not-allowed}
 .choices{display:flex;flex-wrap:wrap;gap:6px}
 .chip{background:transparent;border:1px solid #3a2c22;color:#a89878;padding:4px 10px;font-family:inherit;
   font-size:11px;letter-spacing:0.08em;cursor:pointer}
