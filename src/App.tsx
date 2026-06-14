@@ -555,7 +555,11 @@ export default function App() {
         let off = p.position * dur + (Math.random() - 0.5) * p.spray * dur;
         off = Math.max(0, Math.min(dur - p.grainSize - 0.01, off));
         const g = ctx.createGain();
-        const peak = 0.55 / Math.sqrt(Math.max(1, p.grainDensity * p.grainSize * 0.5));
+        // gentle loudness compensation: instead of fully cancelling overlap
+        // (which makes size/density inaudible), under-compensate so denser /
+        // longer grains audibly thicken the texture and lift the level a touch.
+        const overlap = Math.max(1, p.grainDensity * p.grainSize);
+        const peak = 0.5 / Math.pow(overlap, 0.35);
         g.gain.setValueAtTime(0, t);
         g.gain.linearRampToValueAtTime(peak, t + p.grainSize * 0.45);
         g.gain.linearRampToValueAtTime(0, t + p.grainSize);
