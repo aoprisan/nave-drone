@@ -69,7 +69,7 @@ The **app icons are also procedural**: `scripts/gen-icons.mjs` draws NAVE's goth
 
 ## PWA & deployment
 
-- **PWA** is configured via `vite-plugin-pwa` in `vite.config.ts` (`registerType: "autoUpdate"`, manifest inline, Workbox precaches the app shell). Because all audio is synthesized in-browser, precaching the shell is enough to run fully offline (only the oracle needs network).
+- **PWA** is configured via `vite-plugin-pwa` in `vite.config.ts` (`registerType: "prompt"`, manifest inline, Workbox precaches the app shell). Because all audio is synthesized in-browser, precaching the shell is enough to run fully offline (only the oracle needs network). Updates are **not** auto-applied — a silent reload would sever a live drone — so `App.tsx` uses `useRegisterSW` and surfaces a "renew" button when `needRefresh` is set; the listener clicks it to cross into the new version.
 - **Base path:** GitHub Pages serves a project site from `/<repo>/`. `vite.config.ts` reads `base` from `process.env.VITE_BASE`, defaulting to `/nave-drone/`. The deploy workflow sets `VITE_BASE=/${{ github.event.repository.name }}/`, so a repo rename Just Works — but local `dev`/`preview` use the `/nave-drone/` default. If you rename the repo, the only thing to update by hand is the default in `vite.config.ts`.
 - **Deploy:** `.github/workflows/deploy.yml` builds on push to `main` and publishes `dist/` via GitHub Pages (Actions source). First-time setup requires enabling Pages → "Build and deployment" → Source: **GitHub Actions** in the repo settings.
 
