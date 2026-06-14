@@ -18,12 +18,12 @@ const SPACES = { chapel: 7, cistern: 16, infinite: 34 } as const;
 const SAMPLES = ["bowed metal", "choir", "wind tape"] as const;
 
 const RANGES = {
-  droneLevel: [0, 0.9], droneDark: [0, 1],
+  droneLevel: [0, 0.9], droneDark: [0, 1], drift: [0, 25], width: [0, 2.5],
   sampleLevel: [0, 0.9], grainSize: [0.05, 2], grainDensity: [1, 30],
   spray: [0, 1], position: [0, 1],
   noiseLevel: [0, 0.7],
-  cutoff: [120, 8000], lfoDepth: [0, 1], lfoRate: [0.01, 0.5],
-  wet: [0.3, 1], drive: [0, 1], flutter: [0, 1], hiss: [0, 0.6],
+  cutoff: [120, 8000], resonance: [0.5, 14], lfoDepth: [0, 1], lfoRate: [0.01, 0.5],
+  wet: [0.3, 1], drive: [0, 1], flutter: [0, 1], hiss: [0, 0.6], output: [0, 1],
 } satisfies Record<string, readonly [number, number]>;
 
 type RootName = keyof typeof ROOTS;
@@ -37,6 +37,8 @@ interface Patch {
   space: SpaceName;
   droneLevel: number;
   droneDark: number;
+  drift: number;
+  width: number;
   sampleLevel: number;
   grainSize: number;
   grainDensity: number;
@@ -44,6 +46,7 @@ interface Patch {
   position: number;
   noiseLevel: number;
   cutoff: number;
+  resonance: number;
   lfoDepth: number;
   lfoRate: number;
   wet: number;
@@ -52,17 +55,18 @@ interface Patch {
   drive: number;
   flutter: number;
   hiss: number;
+  output: number;
   seed: number;
 }
 
 const DEFAULT_PATCH: Patch = {
   root: "D1", sampleType: "bowed metal", space: "cistern",
-  droneLevel: 0.55, droneDark: 0.7,
+  droneLevel: 0.55, droneDark: 0.7, drift: 4, width: 1,
   sampleLevel: 0.45, grainSize: 0.6, grainDensity: 8, spray: 0.3, position: 0.3,
   noiseLevel: 0.18,
-  cutoff: 900, lfoDepth: 0.35, lfoRate: 0.06,
+  cutoff: 900, resonance: 0.9, lfoDepth: 0.35, lfoRate: 0.06,
   wet: 0.75, freeze: false, moonLink: false,
-  drive: 0.3, flutter: 0.35, hiss: 0.15,
+  drive: 0.3, flutter: 0.35, hiss: 0.15, output: 0.9,
   seed: 271,
 };
 
@@ -116,6 +120,7 @@ interface Engine {
   drift: OscillatorNode;
   driftGain: GainNode;
   droneOscs: OscillatorNode[];
+  droneBaseCents: number[];
   subOsc: OscillatorNode;
   subGain: GainNode;
   noiseSrc: AudioBufferSourceNode;
@@ -231,6 +236,131 @@ async function renderSample(type: SampleName, sr: number): Promise<AudioBuffer> 
   return off.startRendering();
 }
 
+// The only bridge from UI to the live graph. Kept module-level so its identity
+// is stable across renders — see Dial below.
+type Update = <K extends keyof Patch>(key: K, value: Patch[K]) => void;
+
+// ── UI ───────────────────────────────────────────────────────
+// A rotary dial — drag (vertical), wheel, or arrow keys. 270° sweep with a
+// gap at the bottom; min at 7:30, max at 4:30. Defined at module scope (NOT
+// inside App): a component re-created every render is a *new type* each time,
+// so React would unmount + remount it on every patch change — which silently
+// kills an in-progress pointer drag after a single step. Stable identity here
+// is what lets the dials actually turn. It only ever calls update(k, …).
+function Dial(
+  { k, label, fmt, disabled, patch, update }: {
+    k: RangeKey; label: string; fmt?: (v: number) => string; disabled?: boolean;
+    patch: Patch; update: Update;
+  },
+) {
+  const [lo, hi] = RANGES[k];
+  const v = patch[k];
+  const span = hi - lo;
+  const f = (v - lo) / span;
+  const angle = -135 + f * 270;
+
+  // angle measured clockwise from 12 o'clock → screen coords (cx=cy=32)
+  const polar = (a: number, r: number): [number, number] => {
+    const rad = (a * Math.PI) / 180;
+    return [32 + r * Math.sin(rad), 32 - r * Math.cos(rad)];
+  };
+  const arc = (a0: number, a1: number, r: number) => {
+    const [x0, y0] = polar(a0, r);
+    const [x1, y1] = polar(a1, r);
+    const large = Math.abs(a1 - a0) > 180 ? 1 : 0;
+    return `M ${x0.toFixed(2)} ${y0.toFixed(2)} A ${r} ${r} 0 ${large} 1 ${x1.toFixed(2)} ${y1.toFixed(2)}`;
+  };
+  const [ix, iy] = polar(angle, 7);
+  const [ox, oy] = polar(angle, 20);
+
+  const clamp = (x: number) => Math.max(lo, Math.min(hi, x));
+  const nudge = (d: number) => { const nv = clamp(v + d); if (nv !== v) update(k, nv); };
+
+  const onPointerDown = (ev: ReactPointerEvent<HTMLDivElement>) => {
+    if (disabled) return;
+    ev.preventDefault();
+    const startY = ev.clientY, startVal = v, el = ev.currentTarget;
+    el.setPointerCapture(ev.pointerId);
+    const move = (e: PointerEvent) => update(k, clamp(startVal + ((startY - e.clientY) / 180) * span));
+    const up = () => {
+      el.releasePointerCapture(ev.pointerId);
+      el.removeEventListener("pointermove", move);
+      el.removeEventListener("pointerup", up);
+      el.removeEventListener("pointercancel", up);
+    };
+    el.addEventListener("pointermove", move);
+    el.addEventListener("pointerup", up);
+    el.addEventListener("pointercancel", up);
+  };
+
+  const onKeyDown = (ev: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (disabled) return;
+    const step = span / 100, big = span / 10;
+    switch (ev.key) {
+      case "ArrowUp": case "ArrowRight": ev.preventDefault(); nudge(step); break;
+      case "ArrowDown": case "ArrowLeft": ev.preventDefault(); nudge(-step); break;
+      case "PageUp": ev.preventDefault(); nudge(big); break;
+      case "PageDown": ev.preventDefault(); nudge(-big); break;
+      case "Home": ev.preventDefault(); update(k, lo); break;
+      case "End": ev.preventDefault(); update(k, hi); break;
+    }
+  };
+
+  const onWheel = (ev: ReactWheelEvent<HTMLDivElement>) => {
+    if (disabled) return;
+    nudge((ev.deltaY < 0 ? 1 : -1) * (span / 50));
+  };
+
+  return (
+    <div
+      className={"dial" + (disabled ? " off" : "")}
+      role="slider"
+      tabIndex={disabled ? -1 : 0}
+      aria-label={label}
+      aria-valuemin={lo}
+      aria-valuemax={hi}
+      aria-valuenow={Number(v.toFixed(3))}
+      aria-valuetext={fmt ? fmt(v) : v.toFixed(2)}
+      aria-disabled={disabled || undefined}
+      onPointerDown={onPointerDown}
+      onKeyDown={onKeyDown}
+      onWheel={onWheel}
+    >
+      <svg viewBox="0 0 64 64" className="knob" aria-hidden="true">
+        <circle cx="32" cy="32" r="27" className="knob-cap" />
+        <path d={arc(-135, 135, 25)} className="knob-track" />
+        {f > 0.001 && <path d={arc(-135, angle, 25)} className="knob-fill" />}
+        <line x1={ix} y1={iy} x2={ox} y2={oy} className="knob-ptr" />
+        <circle cx="32" cy="32" r="4.5" className="knob-hub" />
+      </svg>
+      <span className="dlbl">{label}{disabled ? " ◑" : ""}</span>
+      <span className="dval">{fmt ? fmt(v) : v.toFixed(2)}</span>
+    </div>
+  );
+}
+
+function Choice<K extends "root" | "sampleType" | "space">(
+  { k, options, label, patch, update }: {
+    k: K; options: readonly Patch[K][]; label: string; patch: Patch; update: Update;
+  },
+) {
+  return (
+    <div className="row">
+      <span className="lbl">{label}</span>
+      <div className="choices">
+        {options.map((o) => (
+          <button
+            key={String(o)} className={patch[k] === o ? "chip on" : "chip"}
+            onClick={() => update(k, o)}
+          >
+            {String(o)}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const [started, setStarted] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -334,7 +464,8 @@ export default function App() {
     e.drift = ctx.createOscillator(); e.drift.frequency.value = 0.05;
     e.driftGain = ctx.createGain(); e.driftGain.gain.value = 4; // ±4 cents
     e.drift.connect(e.driftGain); e.drift.start();
-    e.droneOscs = [-9, -4, 0, 5, 11].map((cents) => {
+    e.droneBaseCents = [-9, -4, 0, 5, 11];
+    e.droneOscs = e.droneBaseCents.map((cents) => {
       const o = ctx.createOscillator();
       o.type = "sawtooth"; o.frequency.value = rootHz; o.detune.value = cents;
       const g = ctx.createGain(); g.gain.value = 0.13;
@@ -404,14 +535,19 @@ export default function App() {
       param.linearRampToValueAtTime(v, t + ramp);
     };
     const rootHz = ROOTS[p.root];
-    e.droneOscs.forEach((o) => set(o.frequency, rootHz));
+    e.droneOscs.forEach((o, i) => {
+      set(o.frequency, rootHz);
+      set(o.detune, e.droneBaseCents[i] * p.width); // chorus spread; drift LFO adds on top
+    });
     set(e.subOsc.frequency, rootHz / 2);
     set(e.droneGain.gain, p.droneLevel * 0.55);
     set(e.droneFilter.frequency, 2200 - p.droneDark * 2050);
     set(e.subGain.gain, 0.25 + p.droneDark * 0.45);
+    set(e.driftGain.gain, p.drift);
     set(e.noiseGain.gain, p.noiseLevel * 0.5);
     set(e.granGain.gain, p.sampleLevel * 0.9);
     set(e.filter.frequency, p.cutoff);
+    set(e.filter.Q, p.resonance);
     set(e.lfo1Gain.gain, p.lfoDepth * p.cutoff * 0.6);
     set(e.lfo1.frequency, p.lfoRate);
     if (e.convolver.buffer !== e.irs[p.space]) e.convolver.buffer = e.irs[p.space];
@@ -422,6 +558,7 @@ export default function App() {
     set(e.rotMakeup.gain, 0.75 - p.drive * 0.25);
     set(e.wowGain.gain, p.flutter * 0.0045);
     set(e.hissGain.gain, p.hiss * 0.025);
+    set(e.master.gain, p.output);
   };
 
   const update = <K extends keyof Patch>(key: K, value: Patch[K]) => {
@@ -463,11 +600,12 @@ export default function App() {
       sampleType: pick(SAMPLES),
       space: pick(Object.keys(SPACES) as SpaceName[]),
       droneLevel: span([0.3, 0.8]), droneDark: span([0.4, 1]),
+      drift: span([1, 16]), width: span([0.4, 2]),
       sampleLevel: span([0.2, 0.8]),
       grainSize: span([0.15, 1.8]), grainDensity: span([3, 22]),
       spray: span(RANGES.spray), position: span(RANGES.position),
       noiseLevel: span([0.05, 0.4]),
-      cutoff: 200 + r() * r() * 4000,
+      cutoff: 200 + r() * r() * 4000, resonance: span([0.6, 9]),
       lfoDepth: span([0.1, 0.8]), lfoRate: span([0.02, 0.3]),
       wet: span([0.5, 1]), drive: span(RANGES.drive),
       flutter: span(RANGES.flutter), hiss: span([0, 0.45]),
@@ -495,7 +633,7 @@ export default function App() {
 Current patch: ${JSON.stringify(editable)}
 Parameter ranges: ${JSON.stringify(RANGES)}
 Also choose: "root" from ${JSON.stringify(Object.keys(ROOTS))}, "sampleType" from ${JSON.stringify(SAMPLES)}, "space" from ${JSON.stringify(Object.keys(SPACES))}.
-Notes: droneDark higher = darker; grainSize in seconds; lfoRate in Hz (slow); wet = reverb amount; drive/flutter/hiss = tape rot.
+Notes: droneDark higher = darker; drift = drone vibrato in cents; width = chorus spread of the drone; grainSize in seconds; resonance = filter Q (bite); lfoRate in Hz (slow); wet = reverb amount; drive/flutter/hiss = tape rot; output = master level.
 Respond with ONLY a JSON object: every key above, plus a "note" key with one short poetic sentence describing the scene. No markdown, no backticks.`,
           }],
         }),
@@ -591,117 +729,6 @@ Respond with ONLY a JSON object: every key above, plus a "note" key with one sho
     if (e) { clearInterval(e.grainTimer); e.ctx.close(); }
   }, []);
 
-  // ── UI ─────────────────────────────────────────────────────
-  // A rotary dial — drag (vertical), wheel, or arrow keys. 270° sweep with a
-  // gap at the bottom; min at 7:30, max at 4:30. Replaces the old <input range>
-  // but speaks the same language: it only ever calls update(k, …).
-  const Dial = (
-    { k, label, fmt, disabled }: { k: RangeKey; label: string; fmt?: (v: number) => string; disabled?: boolean },
-  ) => {
-    const [lo, hi] = RANGES[k];
-    const v = patch[k];
-    const span = hi - lo;
-    const f = (v - lo) / span;
-    const angle = -135 + f * 270;
-
-    // angle measured clockwise from 12 o'clock → screen coords (cx=cy=32)
-    const polar = (a: number, r: number): [number, number] => {
-      const rad = (a * Math.PI) / 180;
-      return [32 + r * Math.sin(rad), 32 - r * Math.cos(rad)];
-    };
-    const arc = (a0: number, a1: number, r: number) => {
-      const [x0, y0] = polar(a0, r);
-      const [x1, y1] = polar(a1, r);
-      const large = Math.abs(a1 - a0) > 180 ? 1 : 0;
-      return `M ${x0.toFixed(2)} ${y0.toFixed(2)} A ${r} ${r} 0 ${large} 1 ${x1.toFixed(2)} ${y1.toFixed(2)}`;
-    };
-    const [ix, iy] = polar(angle, 7);
-    const [ox, oy] = polar(angle, 20);
-
-    const clamp = (x: number) => Math.max(lo, Math.min(hi, x));
-    const nudge = (d: number) => { const nv = clamp(v + d); if (nv !== v) update(k, nv); };
-
-    const onPointerDown = (ev: ReactPointerEvent<HTMLDivElement>) => {
-      if (disabled) return;
-      ev.preventDefault();
-      const startY = ev.clientY, startVal = v, el = ev.currentTarget;
-      el.setPointerCapture(ev.pointerId);
-      const move = (e: PointerEvent) => update(k, clamp(startVal + ((startY - e.clientY) / 180) * span));
-      const up = () => {
-        el.releasePointerCapture(ev.pointerId);
-        el.removeEventListener("pointermove", move);
-        el.removeEventListener("pointerup", up);
-        el.removeEventListener("pointercancel", up);
-      };
-      el.addEventListener("pointermove", move);
-      el.addEventListener("pointerup", up);
-      el.addEventListener("pointercancel", up);
-    };
-
-    const onKeyDown = (ev: ReactKeyboardEvent<HTMLDivElement>) => {
-      if (disabled) return;
-      const step = span / 100, big = span / 10;
-      switch (ev.key) {
-        case "ArrowUp": case "ArrowRight": ev.preventDefault(); nudge(step); break;
-        case "ArrowDown": case "ArrowLeft": ev.preventDefault(); nudge(-step); break;
-        case "PageUp": ev.preventDefault(); nudge(big); break;
-        case "PageDown": ev.preventDefault(); nudge(-big); break;
-        case "Home": ev.preventDefault(); update(k, lo); break;
-        case "End": ev.preventDefault(); update(k, hi); break;
-      }
-    };
-
-    const onWheel = (ev: ReactWheelEvent<HTMLDivElement>) => {
-      if (disabled) return;
-      nudge((ev.deltaY < 0 ? 1 : -1) * (span / 50));
-    };
-
-    return (
-      <div
-        className={"dial" + (disabled ? " off" : "")}
-        role="slider"
-        tabIndex={disabled ? -1 : 0}
-        aria-label={label}
-        aria-valuemin={lo}
-        aria-valuemax={hi}
-        aria-valuenow={Number(v.toFixed(3))}
-        aria-valuetext={fmt ? fmt(v) : v.toFixed(2)}
-        aria-disabled={disabled || undefined}
-        onPointerDown={onPointerDown}
-        onKeyDown={onKeyDown}
-        onWheel={onWheel}
-      >
-        <svg viewBox="0 0 64 64" className="knob" aria-hidden="true">
-          <circle cx="32" cy="32" r="27" className="knob-cap" />
-          <path d={arc(-135, 135, 25)} className="knob-track" />
-          {f > 0.001 && <path d={arc(-135, angle, 25)} className="knob-fill" />}
-          <line x1={ix} y1={iy} x2={ox} y2={oy} className="knob-ptr" />
-          <circle cx="32" cy="32" r="4.5" className="knob-hub" />
-        </svg>
-        <span className="dlbl">{label}{disabled ? " ◑" : ""}</span>
-        <span className="dval">{fmt ? fmt(v) : v.toFixed(2)}</span>
-      </div>
-    );
-  };
-
-  const Choice = <K extends "root" | "sampleType" | "space">(
-    { k, options, label }: { k: K; options: readonly Patch[K][]; label: string },
-  ) => (
-    <div className="row">
-      <span className="lbl">{label}</span>
-      <div className="choices">
-        {options.map((o) => (
-          <button
-            key={String(o)} className={patch[k] === o ? "chip on" : "chip"}
-            onClick={() => update(k, o)}
-          >
-            {String(o)}
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-
   return (
     <div className="nave">
       <style>{CSS}</style>
@@ -753,43 +780,47 @@ Respond with ONLY a JSON object: every key above, plus a "note" key with one sho
 
           <section>
             <h2>foundation</h2>
-            <Choice k="root" label="root" options={Object.keys(ROOTS) as RootName[]} />
+            <Choice k="root" label="root" options={Object.keys(ROOTS) as RootName[]} patch={patch} update={update} />
             <div className="dials">
-              <Dial k="droneLevel" label="drone" disabled={patch.moonLink} />
-              <Dial k="droneDark" label="darkness" disabled={patch.moonLink} />
-              <Dial k="noiseLevel" label="floor" />
+              <Dial k="droneLevel" label="drone" disabled={patch.moonLink} patch={patch} update={update} />
+              <Dial k="droneDark" label="darkness" disabled={patch.moonLink} patch={patch} update={update} />
+              <Dial k="width" label="spread" fmt={(v) => v.toFixed(2) + "×"} patch={patch} update={update} />
+              <Dial k="drift" label="drift" fmt={(v) => "±" + v.toFixed(0) + "¢"} patch={patch} update={update} />
+              <Dial k="noiseLevel" label="floor" patch={patch} update={update} />
             </div>
           </section>
 
           <section>
             <h2>grains</h2>
-            <Choice k="sampleType" label="source" options={SAMPLES} />
+            <Choice k="sampleType" label="source" options={SAMPLES} patch={patch} update={update} />
             <div className="dials">
-              <Dial k="sampleLevel" label="level" />
-              <Dial k="grainSize" label="size" fmt={(v) => v.toFixed(2) + "s"} />
-              <Dial k="grainDensity" label="density" fmt={(v) => v.toFixed(0) + "/s"} />
-              <Dial k="position" label="position" />
-              <Dial k="spray" label="spray" />
+              <Dial k="sampleLevel" label="level" patch={patch} update={update} />
+              <Dial k="grainSize" label="size" fmt={(v) => v.toFixed(2) + "s"} patch={patch} update={update} />
+              <Dial k="grainDensity" label="density" fmt={(v) => v.toFixed(0) + "/s"} patch={patch} update={update} />
+              <Dial k="position" label="position" patch={patch} update={update} />
+              <Dial k="spray" label="spray" patch={patch} update={update} />
             </div>
           </section>
 
           <section>
             <h2>air</h2>
             <div className="dials">
-              <Dial k="cutoff" label="filter" fmt={(v) => v.toFixed(0) + "Hz"} />
-              <Dial k="lfoDepth" label="breath depth" />
-              <Dial k="lfoRate" label="breath rate" fmt={(v) => v.toFixed(2) + "Hz"} />
-              <Dial k="wet" label="immersion" />
+              <Dial k="cutoff" label="filter" fmt={(v) => v.toFixed(0) + "Hz"} patch={patch} update={update} />
+              <Dial k="resonance" label="bite" fmt={(v) => "Q " + v.toFixed(1)} patch={patch} update={update} />
+              <Dial k="lfoDepth" label="breath depth" patch={patch} update={update} />
+              <Dial k="lfoRate" label="breath rate" fmt={(v) => v.toFixed(2) + "Hz"} patch={patch} update={update} />
+              <Dial k="wet" label="immersion" patch={patch} update={update} />
             </div>
-            <Choice k="space" label="space" options={Object.keys(SPACES) as SpaceName[]} />
+            <Choice k="space" label="space" options={Object.keys(SPACES) as SpaceName[]} patch={patch} update={update} />
           </section>
 
           <section>
             <h2>rot</h2>
             <div className="dials">
-              <Dial k="drive" label="saturation" />
-              <Dial k="flutter" label="wow" />
-              <Dial k="hiss" label="hiss" />
+              <Dial k="drive" label="saturation" patch={patch} update={update} />
+              <Dial k="flutter" label="wow" patch={patch} update={update} />
+              <Dial k="hiss" label="hiss" patch={patch} update={update} />
+              <Dial k="output" label="output" patch={patch} update={update} />
             </div>
           </section>
 
