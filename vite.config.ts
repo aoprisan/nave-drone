@@ -12,7 +12,10 @@ export default defineConfig({
   plugins: [
     react(),
     VitePWA({
-      registerType: "autoUpdate",
+      // "prompt", not "autoUpdate": a silent reload would sever a live drone
+      // mid-session. Instead the app surfaces a "renew" button (see App.tsx)
+      // and the listener decides when to cross into the new version.
+      registerType: "prompt",
       includeAssets: ["favicon.svg", "apple-touch-icon.png"],
       manifest: {
         name: "NAVE — drone engine",

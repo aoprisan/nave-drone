@@ -4,6 +4,7 @@ import type {
   KeyboardEvent as ReactKeyboardEvent,
   WheelEvent as ReactWheelEvent,
 } from "react";
+import { useRegisterSW } from "virtual:pwa-register/react";
 
 // ─────────────────────────────────────────────────────────────
 // NAVE — drone engine v0
@@ -244,6 +245,16 @@ export default function App() {
   const patchRef = useRef<Patch>(patch); // for the grain scheduler
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   patchRef.current = patch;
+
+  // ── service-worker renewal ─────────────────────────────────
+  // A newer build has been precached and is waiting; `needRefresh` flips true.
+  // updateServiceWorker(true) activates the waiting worker and reloads the page
+  // — so we only offer it as a manual "renew" button, never auto-apply, to
+  // avoid tearing down a live drone without consent.
+  const {
+    needRefresh: [needRefresh],
+    updateServiceWorker,
+  } = useRegisterSW();
 
   // ── engine construction ────────────────────────────────────
   const start = async () => {
@@ -694,6 +705,16 @@ Respond with ONLY a JSON object: every key above, plus a "note" key with one sho
   return (
     <div className="nave">
       <style>{CSS}</style>
+
+      {needRefresh && (
+        <div className="renew" role="status">
+          <span>a newer rite has been consecrated</span>
+          <button className="big on" onClick={() => updateServiceWorker(true)}>
+            ↻ renew
+          </button>
+        </div>
+      )}
+
       <header>
         <h1>NAVE</h1>
         <p className="sub">drone engine · vespers for the empty hall</p>
@@ -801,6 +822,9 @@ const CSS = `
 header{text-align:center;margin-bottom:14px}
 h1{font-size:34px;letter-spacing:0.5em;margin:0;font-weight:400;color:#e6dcc4;text-indent:0.5em}
 .sub{margin:4px 0 0;font-size:12px;letter-spacing:0.18em;color:#8a7d66;font-style:italic}
+.renew{display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:10px;
+  margin-bottom:14px;padding:10px 14px;background:rgba(58,21,21,0.55);border:1px solid #7a2020;
+  font-size:12px;letter-spacing:0.1em;color:#e6dcc4;font-style:italic}
 .gate{display:flex;flex-direction:column;align-items:center;gap:14px;padding:70px 0}
 .hint{font-size:12px;color:#6e6350;letter-spacing:0.08em}
 .smoke{width:100%;height:120px;display:block;background:#0c0907;border:1px solid #2a201a;margin-bottom:14px}
